@@ -3,15 +3,19 @@
   "canisters": {
     "icpnomad_wallet": {
       "type": "motoko",
-      "main": "src/canisters/ICPNomadWallet.mo"
+      "main": "src/canisters/ICPNomadWallet.mo",
+      "dependencies": ["sha256"]
     },
     "icpnomad_backend": {
       "type": "custom",
-      "build": "npm run build:backend",
+      "build": "pnpm run build:backend",
       "root": "src/backend",
       "wasm": ".dfx/local/canisters/icpnomad_backend/icpnomad_backend.wasm",
       "candid": ".dfx/local/canisters/icpnomad_backend/icpnomad_backend.did"
     }
+  },
+  "dependencies": {
+    "sha256": "https://github.com/research-ag/sha256#v0.1.1"
   },
   "networks": {
     "local": {
