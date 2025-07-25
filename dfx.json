@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "canisters": {
+    "icpnomad_wallet": {
+      "type": "motoko",
+      "main": "src/canisters/ICPNomadWallet.mo"
+    },
+    "icpnomad_backend": {
+      "type": "custom",
+      "build": "npm run build:backend",
+      "root": "src/backend",
+      "wasm": ".dfx/local/canisters/icpnomad_backend/icpnomad_backend.wasm",
+      "candid": ".dfx/local/canisters/icpnomad_backend/icpnomad_backend.did"
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:4943",
+      "type": "ephemeral",
+      "replica": {
+        "subnet_type": "application"
+      }
+    },
+    "ic": {
+      "providers": ["https://icp0.io"],
+      "type": "persistent"
+    },
+    "playground": {
+      "providers": ["https://play.dfinity.org"],
+      "type": "playground"
+    }
+  },
+  "output_env_file": ".env.local",
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    },
+    "start": {
+      "address": "127.0.0.1",
+      "port": 4943,
+      "serve_root": "./dist"
+    },
+    "stop": {
+      "timeout": 5
+    }
+  }
+}
