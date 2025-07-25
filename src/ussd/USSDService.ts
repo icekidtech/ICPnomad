@@ -686,7 +686,7 @@ class USSDService {
    */
   getSessionStats(): { activeSessions: number; totalSessions: number } {
     return {
-      activeSession: this.sessions.size,
+      activeSessions: this.sessions.size,
       totalSessions: this.sessions.size // In a real implementation, track total separately
     };
   }

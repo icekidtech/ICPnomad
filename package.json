@@ -38,6 +38,8 @@
     "@dfinity/candid": "^0.20.0",
     "@dfinity/identity": "^0.20.0",
     "@dfinity/principal": "^0.20.0",
+    "@types/axios": "^0.14.4",
+    "axios": "^1.11.0",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
