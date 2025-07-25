@@ -11,16 +11,18 @@ import Blob "mo:base/Blob";
 import Nat8 "mo:base/Nat8";
 import Nat "mo:base/Nat";
 import SHA256 "mo:sha256/SHA256";
+import Option "mo:base/Option";
 
 // Import stablecoin interface
 import Stablecoin "./Stablecoin";
 
 /**
- * ICPNomadWallet Canister with Stablecoin Support
+ * ICPNomadWallet Canister with Enhanced Security Features
  * 
  * A privacy-preserving wallet canister for USSD-based cryptocurrency access.
  * Ensures phone numbers are never stored while maintaining one-account-per-phone uniqueness.
- * Now supports stablecoin operations with gasless transactions.
+ * Includes PIN-based authentication with hashed storage and signature verification.
+ * Supports stablecoin operations with gasless transactions.
  */
 actor ICPNomadWallet {
     
@@ -58,16 +60,21 @@ actor ICPNomadWallet {
         fromAddress: ?Principal;
         toAddress: ?Principal;
         tokenType: Text; // "ICP" or "STABLECOIN"
+        signature: ?Text; // Optional signature for verification
     };
     
-    /// Enhanced wallet data structure with stablecoin support
+    /// Enhanced wallet data structure with security features
     public type Wallet = {
         address: Principal;
         icpBalance: Nat;
         stablecoinBalance: Nat;
+        pinHash: Text; // Hashed PIN for authentication
         createdAt: Time;
         lastActivity: Time;
         transactionHistory: [Transaction];
+        failedAttempts: Nat; // Track failed authentication attempts
+        lastFailedAttempt: ?Time; // Timestamp of last failed attempt
+        isLocked: Bool; // Account lockout status
     };
     
     /// Error types for better error handling
@@ -80,6 +87,16 @@ actor ICPNomadWallet {
         #transactionFailed;
         #stablecoinError: Text;
         #systemError: Text;
+        #invalidSignature;
+        #accountLocked;
+        #rateLimitExceeded;
+    };
+    
+    /// Signature verification result
+    public type SignatureVerification = {
+        #valid;
+        #invalid;
+        #missing;
     };
     
     // ======================
@@ -104,6 +121,11 @@ actor ICPNomadWallet {
     /// Stablecoin canister reference (configurable)
     private stable var stablecoinCanisterId: Text = "rdmx6-jaaaa-aaaah-qcaiq-cai"; // Default ckUSDC canister ID
     
+    /// Security configuration
+    private stable var maxFailedAttempts: Nat = 5; // Maximum failed PIN attempts before lockout
+    private stable var lockoutDuration: Int = 3600_000_000_000; // 1 hour in nanoseconds
+    private stable var securitySalt: Text = "icpnomad_security_salt_2024"; // Additional salt for security
+    
     // ======================
     // SYSTEM FUNCTIONS
     // ======================
@@ -120,7 +142,163 @@ actor ICPNomadWallet {
     };
     
     // ======================
-    // PRIVATE UTILITY FUNCTIONS
+    // SECURITY UTILITY FUNCTIONS
+    // ======================
+    
+    /// Generates a secure hash for PIN storage
+    private func hashPin(phoneNumber: Text, pin: Text): Text {
+        let combinedInput = phoneNumber # ":" # pin # ":" # securitySalt;
+        let inputBlob = Text.encodeUtf8(combinedInput);
+        let hashBlob = SHA256.sha256(inputBlob);
+        let hashArray = Blob.toArray(hashBlob);
+        
+        // Convert hash to hex string for storage
+        let hexChars = "0123456789abcdef";
+        var result = "";
+        for (byte in hashArray.vals()) {
+            let high = Nat8.toNat(byte / 16);
+            let low = Nat8.toNat(byte % 16);
+            result := result # Text.fromChar(hexChars.chars().nth(high).unwrap()) # 
+                     Text.fromChar(hexChars.chars().nth(low).unwrap());
+        };
+        result
+    };
+    
+    /// Verifies PIN against stored hash
+    private func verifyPin(phoneNumber: Text, pin: Text, storedHash: Text): Bool {
+        let computedHash = hashPin(phoneNumber, pin);
+        Text.equal(computedHash, storedHash)
+    };
+    
+    /// Validates transaction signature (basic implementation)
+    /// In production, this would use ICP's threshold ECDSA or other cryptographic schemes
+    private func verifyTransactionSignature(
+        txData: Text,
+        signature: ?Text,
+        walletAddress: Principal
+    ): SignatureVerification {
+        switch (signature) {
+            case null { #missing };
+            case (?sig) {
+                // Basic signature verification - in production, use proper cryptographic verification
+                let expectedSig = generateTransactionSignature(txData, walletAddress);
+                if (Text.equal(sig, expectedSig)) {
+                    #valid
+                } else {
+                    #invalid
+                }
+            };
+        }
+    };
+    
+    /// Generates expected signature for transaction data (placeholder implementation)
+    private func generateTransactionSignature(txData: Text, walletAddress: Principal): Text {
+        let combinedData = txData # ":" # Principal.toText(walletAddress) # ":" # securitySalt;
+        let inputBlob = Text.encodeUtf8(combinedData);
+        let hashBlob = SHA256.sha256(inputBlob);
+        let hashArray = Blob.toArray(hashBlob);
+        
+        // Convert to hex string
+        let hexChars = "0123456789abcdef";
+        var result = "";
+        for (byte in hashArray.vals()) {
+            let high = Nat8.toNat(byte / 16);
+            let low = Nat8.toNat(byte % 16);
+            result := result # Text.fromChar(hexChars.chars().nth(high).unwrap()) # 
+                     Text.fromChar(hexChars.chars().nth(low).unwrap());
+        };
+        result
+    };
+    
+    /// Checks if account is locked due to failed attempts
+    private func isAccountLocked(wallet: Wallet): Bool {
+        if (not wallet.isLocked) { return false };
+        
+        switch (wallet.lastFailedAttempt) {
+            case null { false };
+            case (?lastAttempt) {
+                let currentTime = Time.now();
+                let timeDiff = currentTime - lastAttempt;
+                if (timeDiff >= lockoutDuration) {
+                    false // Lockout period expired
+                } else {
+                    true // Still locked
+                }
+            };
+        }
+    };
+    
+    /// Updates failed attempt counter and locks account if necessary
+    private func handleFailedAuthentication(walletAddress: Principal, wallet: Wallet): Wallet {
+        let newFailedAttempts = wallet.failedAttempts + 1;
+        let shouldLock = newFailedAttempts >= maxFailedAttempts;
+        
+        {
+            address = wallet.address;
+            icpBalance = wallet.icpBalance;
+            stablecoinBalance = wallet.stablecoinBalance;
+            pinHash = wallet.pinHash;
+            createdAt = wallet.createdAt;
+            lastActivity = wallet.lastActivity;
+            transactionHistory = wallet.transactionHistory;
+            failedAttempts = newFailedAttempts;
+            lastFailedAttempt = ?Time.now();
+            isLocked = shouldLock;
+        }
+    };
+    
+    /// Resets failed attempts on successful authentication
+    private func resetFailedAttempts(wallet: Wallet): Wallet {
+        {
+            address = wallet.address;
+            icpBalance = wallet.icpBalance;
+            stablecoinBalance = wallet.stablecoinBalance;
+            pinHash = wallet.pinHash;
+            createdAt = wallet.createdAt;
+            lastActivity = Time.now();
+            transactionHistory = wallet.transactionHistory;
+            failedAttempts = 0;
+            lastFailedAttempt = null;
+            isLocked = false;
+        }
+    };
+    
+    /// Authenticates user and returns wallet if valid
+    private func authenticateUser(phoneNumber: Text, pin: Text): Result<Wallet, WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
+            return #err(#invalidCredentials);
+        };
+        
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?wallet) {
+                // Check if account is locked
+                if (isAccountLocked(wallet)) {
+                    return #err(#accountLocked);
+                };
+                
+                // Verify PIN
+                if (verifyPin(phoneNumber, pin, wallet.pinHash)) {
+                    // Reset failed attempts on successful authentication
+                    let updatedWallet = resetFailedAttempts(wallet);
+                    wallets.put(walletAddress, updatedWallet);
+                    #ok(updatedWallet)
+                } else {
+                    // Handle failed authentication
+                    let updatedWallet = handleFailedAuthentication(walletAddress, wallet);
+                    wallets.put(walletAddress, updatedWallet);
+                    #err(#invalidCredentials)
+                }
+            };
+            case null {
+                #err(#walletNotFound)
+            };
+        }
+    };
+    
+    // ======================
+    // EXISTING UTILITY FUNCTIONS (UPDATED)
     // ======================
     
     /// Derives a deterministic Principal from phone number and PIN
@@ -164,13 +342,14 @@ actor ICPNomadWallet {
         "txn_" # Nat.toText(transactionCounter) # "_" # Nat.toText(Int.abs(Time.now()))
     };
     
-    /// Creates a new transaction record
+    /// Creates a new transaction record with signature support
     private func createTransaction(
         txType: TransactionType,
         amount: Nat,
         fromAddress: ?Principal,
         toAddress: ?Principal,
-        tokenType: Text
+        tokenType: Text,
+        signature: ?Text
     ): Transaction {
         {
             id = generateTransactionId();
@@ -181,6 +360,7 @@ actor ICPNomadWallet {
             fromAddress = fromAddress;
             toAddress = toAddress;
             tokenType = tokenType;
+            signature = signature;
         }
     };
     
@@ -193,9 +373,13 @@ actor ICPNomadWallet {
                     address = wallet.address;
                     icpBalance = wallet.icpBalance;
                     stablecoinBalance = wallet.stablecoinBalance;
+                    pinHash = wallet.pinHash;
                     createdAt = wallet.createdAt;
                     lastActivity = Time.now();
                     transactionHistory = updatedHistory;
+                    failedAttempts = wallet.failedAttempts;
+                    lastFailedAttempt = wallet.lastFailedAttempt;
+                    isLocked = wallet.isLocked;
                 };
                 wallets.put(walletAddress, updatedWallet);
             };
@@ -211,10 +395,10 @@ actor ICPNomadWallet {
     };
     
     // ======================
-    // EXISTING WALLET FUNCTIONS (UPDATED)
+    // WALLET FUNCTIONS (UPDATED WITH SECURITY)
     // ======================
     
-    /// Generates a new wallet for a phone number and PIN combination
+    /// Generates a new wallet for a phone number and PIN combination with secure PIN storage
     public func generateWallet(phoneNumber: Text, pin: Text): async Result<Principal, WalletError> {
         // Validate inputs
         if (not isValidPhoneNumber(phoneNumber)) {
@@ -234,24 +418,31 @@ actor ICPNomadWallet {
                 #err(#addressAlreadyExists)
             };
             case null {
-                // Create new wallet with stablecoin support
+                // Generate secure PIN hash
+                let pinHash = hashPin(phoneNumber, pin);
+                
+                // Create new wallet with security features
                 let newWallet: Wallet = {
                     address = walletAddress;
                     icpBalance = 0;
                     stablecoinBalance = 0;
+                    pinHash = pinHash;
                     createdAt = Time.now();
                     lastActivity = Time.now();
                     transactionHistory = [];
+                    failedAttempts = 0;
+                    lastFailedAttempt = null;
+                    isLocked = false;
                 };
                 
                 wallets.put(walletAddress, newWallet);
-                Debug.print("New wallet created: " # Principal.toText(walletAddress));
+                Debug.print("New secure wallet created: " # Principal.toText(walletAddress));
                 #ok(walletAddress)
             };
         };
     };
     
-    /// Retrieves ICP balance using phone number and PIN
+    /// Retrieves ICP balance using secure authentication
     public query func getBalance(phoneNumber: Text, pin: Text): async Result<Nat, WalletError> {
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
@@ -261,7 +452,17 @@ actor ICPNomadWallet {
         
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
-                #ok(wallet.icpBalance)
+                // Check if account is locked
+                if (isAccountLocked(wallet)) {
+                    return #err(#accountLocked);
+                };
+                
+                // Verify PIN
+                if (verifyPin(phoneNumber, pin, wallet.pinHash)) {
+                    #ok(wallet.icpBalance)
+                } else {
+                    #err(#invalidCredentials)
+                }
             };
             case null {
                 #err(#walletNotFound)
@@ -349,38 +550,48 @@ actor ICPNomadWallet {
     // NEW STABLECOIN FUNCTIONS
     // ======================
     
-    /// Retrieves stablecoin balance using phone number and PIN
+    /// Retrieves stablecoin balance using secure authentication
     public query func getStablecoinBalance(phoneNumber: Text, pin: Text): async Result<Nat, WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return #err(#invalidCredentials);
-        };
-        
-        let walletAddress = deriveWalletAddress(phoneNumber, pin);
-        
-        switch (wallets.get(walletAddress)) {
-            case (?wallet) {
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#ok(wallet)) {
                 #ok(wallet.stablecoinBalance)
             };
-            case null {
-                #err(#walletNotFound)
+            case (#err(error)) {
+                #err(error)
             };
-        };
+        }
     };
     
-    /// Deposits stablecoins to wallet (gasless transaction)
-    public func depositStablecoin(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return #err(#invalidCredentials);
-        };
-        
+    /// Deposits stablecoins to wallet with signature verification (gasless transaction)
+    public func depositStablecoin(
+        phoneNumber: Text, 
+        pin: Text, 
+        amount: Nat,
+        signature: ?Text
+    ): async Result<(), WalletError> {
         if (amount == 0) {
             return #err(#invalidAmount);
         };
         
-        let walletAddress = deriveWalletAddress(phoneNumber, pin);
-        
-        switch (wallets.get(walletAddress)) {
-            case (?wallet) {
+        // Authenticate user
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#err(error)) { return #err(error) };
+            case (#ok(wallet)) {
+                // Verify transaction signature
+                let txData = "deposit_stablecoin:" # Nat.toText(amount) # ":" # Nat.toText(Time.now());
+                let sigVerification = verifyTransactionSignature(txData, signature, wallet.address);
+                
+                switch (sigVerification) {
+                    case (#invalid) { return #err(#invalidSignature) };
+                    case (#missing) { 
+                        // For deposits, signature might be optional depending on implementation
+                        Debug.print("Warning: Deposit without signature");
+                    };
+                    case (#valid) {
+                        Debug.print("Signature verified for deposit");
+                    };
+                };
+                
                 // In a real implementation, this would interact with the stablecoin canister
                 // For now, we simulate the deposit by updating the balance
                 // TODO: Implement actual stablecoin transfer from external source
@@ -389,79 +600,91 @@ actor ICPNomadWallet {
                     address = wallet.address;
                     icpBalance = wallet.icpBalance;
                     stablecoinBalance = wallet.stablecoinBalance + amount;
+                    pinHash = wallet.pinHash;
                     createdAt = wallet.createdAt;
                     lastActivity = Time.now();
                     transactionHistory = wallet.transactionHistory;
+                    failedAttempts = wallet.failedAttempts;
+                    lastFailedAttempt = wallet.lastFailedAttempt;
+                    isLocked = wallet.isLocked;
                 };
                 
-                wallets.put(walletAddress, updatedWallet);
+                wallets.put(wallet.address, updatedWallet);
                 
-                let transaction = createTransaction(#stablecoinDeposit, amount, null, ?walletAddress, "STABLECOIN");
-                addTransactionToWallet(walletAddress, transaction);
+                let transaction = createTransaction(#stablecoinDeposit, amount, null, ?wallet.address, "STABLECOIN", signature);
+                addTransactionToWallet(wallet.address, transaction);
                 
-                Debug.print("Stablecoin deposit successful: " # Nat.toText(amount) # " to " # Principal.toText(walletAddress));
+                Debug.print("Secure stablecoin deposit successful: " # Nat.toText(amount) # " to " # Principal.toText(wallet.address));
                 #ok(())
             };
-            case null {
-                #err(#walletNotFound)
-            };
-        };
+        }
     };
     
-    /// Withdraws stablecoins from wallet (gasless transaction)
-    public func withdrawStablecoin(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return #err(#invalidCredentials);
-        };
-        
+    /// Withdraws stablecoins from wallet with signature verification (gasless transaction)
+    public func withdrawStablecoin(
+        phoneNumber: Text, 
+        pin: Text, 
+        amount: Nat,
+        signature: ?Text
+    ): async Result<(), WalletError> {
         if (amount == 0) {
             return #err(#invalidAmount);
         };
         
-        let walletAddress = deriveWalletAddress(phoneNumber, pin);
-        
-        switch (wallets.get(walletAddress)) {
-            case (?wallet) {
+        // Authenticate user
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#err(error)) { return #err(error) };
+            case (#ok(wallet)) {
                 if (wallet.stablecoinBalance < amount) {
                     return #err(#insufficientFunds);
                 };
                 
-                // In a real implementation, this would transfer stablecoins to external address
-                // For now, we simulate the withdrawal by updating the balance
-                // TODO: Implement actual stablecoin transfer to external address
+                // Verify transaction signature (required for withdrawals)
+                let txData = "withdraw_stablecoin:" # Nat.toText(amount) # ":" # Nat.toText(Time.now());
+                let sigVerification = verifyTransactionSignature(txData, signature, wallet.address);
                 
-                let updatedWallet = {
-                    address = wallet.address;
-                    icpBalance = wallet.icpBalance;
-                    stablecoinBalance = wallet.stablecoinBalance - amount;
-                    createdAt = wallet.createdAt;
-                    lastActivity = Time.now();
-                    transactionHistory = wallet.transactionHistory;
-                };
-                
-                wallets.put(walletAddress, updatedWallet);
-                
-                let transaction = createTransaction(#stablecoinWithdrawal, amount, ?walletAddress, null, "STABLECOIN");
-                addTransactionToWallet(walletAddress, transaction);
-                
-                Debug.print("Stablecoin withdrawal successful: " # Nat.toText(amount) # " from " # Principal.toText(walletAddress));
-                #ok(())
+                switch (sigVerification) {
+                    case (#invalid or #missing) { return #err(#invalidSignature) };
+                    case (#valid) {
+                        // In a real implementation, this would transfer stablecoins to external address
+                        // For now, we simulate the withdrawal by updating the balance
+                        // TODO: Implement actual stablecoin transfer to external address
+                        
+                        let updatedWallet = {
+                            address = wallet.address;
+                            icpBalance = wallet.icpBalance;
+                            stablecoinBalance = wallet.stablecoinBalance - amount;
+                            pinHash = wallet.pinHash;
+                            createdAt = wallet.createdAt;
+                            lastActivity = Time.now();
+                            transactionHistory = wallet.transactionHistory;
+                            failedAttempts = wallet.failedAttempts;
+                            lastFailedAttempt = wallet.lastFailedAttempt;
+                            isLocked = wallet.isLocked;
+                        };
+                        
+                        wallets.put(wallet.address, updatedWallet);
+                        
+                        let transaction = createTransaction(#stablecoinWithdrawal, amount, ?wallet.address, null, "STABLECOIN", signature);
+                        addTransactionToWallet(wallet.address, transaction);
+                        
+                        Debug.print("Secure stablecoin withdrawal successful: " # Nat.toText(amount) # " from " # Principal.toText(wallet.address));
+                        #ok(())
+                    };
+                }
             };
-            case null {
-                #err(#walletNotFound)
-            };
-        };
+        }
     };
     
-    /// Transfers stablecoins between wallets (gasless transaction)
+    /// Transfers stablecoins between wallets with signature verification (gasless transaction)
     public func transferStablecoin(
         phoneNumber: Text, 
         pin: Text, 
         recipientPhoneNumber: Text, 
-        amount: Nat
+        amount: Nat,
+        signature: ?Text
     ): async Result<(), WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin) or
-            not isValidPhoneNumber(recipientPhoneNumber)) {
+        if (not isValidPhoneNumber(recipientPhoneNumber)) {
             return #err(#invalidCredentials);
         };
         
@@ -469,107 +692,91 @@ actor ICPNomadWallet {
             return #err(#invalidAmount);
         };
         
-        let senderAddress = deriveWalletAddress(phoneNumber, pin);
-        let recipientAddress = deriveWalletAddress(recipientPhoneNumber, "0000"); // Recipient PIN not needed for address derivation
-        
-        // Cannot transfer to same wallet
-        if (Principal.equal(senderAddress, recipientAddress)) {
-            return #err(#invalidAmount);
-        };
-        
-        // Check both wallets exist
-        switch (wallets.get(senderAddress), wallets.get(recipientAddress)) {
-            case (?senderWallet, ?recipientWallet) {
+        // Authenticate sender
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#err(error)) { return #err(error) };
+            case (#ok(senderWallet)) {
                 if (senderWallet.stablecoinBalance < amount) {
                     return #err(#insufficientFunds);
                 };
                 
-                // Update sender wallet
-                let updatedSenderWallet = {
-                    address = senderWallet.address;
-                    icpBalance = senderWallet.icpBalance;
-                    stablecoinBalance = senderWallet.stablecoinBalance - amount;
-                    createdAt = senderWallet.createdAt;
-                    lastActivity = Time.now();
-                    transactionHistory = senderWallet.transactionHistory;
-                };
+                // Verify transaction signature (required for transfers)
+                let txData = "transfer_stablecoin:" # recipientPhoneNumber # ":" # Nat.toText(amount) # ":" # Nat.toText(Time.now());
+                let sigVerification = verifyTransactionSignature(txData, signature, senderWallet.address);
                 
-                // Update recipient wallet
-                let updatedRecipientWallet = {
-                    address = recipientWallet.address;
-                    icpBalance = recipientWallet.icpBalance;
-                    stablecoinBalance = recipientWallet.stablecoinBalance + amount;
-                    createdAt = recipientWallet.createdAt;
-                    lastActivity = Time.now();
-                    transactionHistory = recipientWallet.transactionHistory;
-                };
-                
-                wallets.put(senderAddress, updatedSenderWallet);
-                wallets.put(recipientAddress, updatedRecipientWallet);
-                
-                let transferTransaction = createTransaction(#stablecoinTransfer, amount, ?senderAddress, ?recipientAddress, "STABLECOIN");
-                addTransactionToWallet(senderAddress, transferTransaction);
-                addTransactionToWallet(recipientAddress, transferTransaction);
-                
-                Debug.print("Stablecoin transfer successful: " # Nat.toText(amount) # " from " # Principal.toText(senderAddress) # " to " # Principal.toText(recipientAddress));
-                #ok(())
-            };
-            case (null, _) {
-                #err(#walletNotFound)
-            };
-            case (_, null) {
-                // Create recipient wallet if it doesn't exist (for simplified transfers)
-                let newRecipientWallet: Wallet = {
-                    address = recipientAddress;
-                    icpBalance = 0;
-                    stablecoinBalance = amount;
-                    createdAt = Time.now();
-                    lastActivity = Time.now();
-                    transactionHistory = [];
-                };
-                
-                switch (wallets.get(senderAddress)) {
-                    case (?senderWallet) {
-                        if (senderWallet.stablecoinBalance < amount) {
-                            return #err(#insufficientFunds);
+                switch (sigVerification) {
+                    case (#invalid or #missing) { return #err(#invalidSignature) };
+                    case (#valid) {
+                        let recipientAddress = deriveWalletAddress(recipientPhoneNumber, "0000"); // Recipient PIN not needed for address derivation
+                        
+                        // Cannot transfer to same wallet
+                        if (Principal.equal(senderWallet.address, recipientAddress)) {
+                            return #err(#invalidAmount);
                         };
                         
-                        let updatedSenderWallet = {
-                            address = senderWallet.address;
-                            icpBalance = senderWallet.icpBalance;
-                            stablecoinBalance = senderWallet.stablecoinBalance - amount;
-                            createdAt = senderWallet.createdAt;
-                            lastActivity = Time.now();
-                            transactionHistory = senderWallet.transactionHistory;
-                        };
-                        
-                        wallets.put(senderAddress, updatedSenderWallet);
-                        wallets.put(recipientAddress, newRecipientWallet);
-                        
-                        let transferTransaction = createTransaction(#stablecoinTransfer, amount, ?senderAddress, ?recipientAddress, "STABLECOIN");
-                        addTransactionToWallet(senderAddress, transferTransaction);
-                        addTransactionToWallet(recipientAddress, transferTransaction);
-                        
-                        #ok(())
-                    };
-                    case null {
-                        #err(#walletNotFound)
+                        // Check both wallets exist
+                        switch (wallets.get(recipientAddress)) {
+                            case (?recipientWallet) {
+                                // Update sender wallet
+                                let updatedSenderWallet = {
+                                    address = senderWallet.address;
+                                    icpBalance = senderWallet.icpBalance;
+                                    stablecoinBalance = senderWallet.stablecoinBalance - amount;
+                                    pinHash = senderWallet.pinHash;
+                                    createdAt = senderWallet.createdAt;
+                                    lastActivity = Time.now();
+                                    transactionHistory = senderWallet.transactionHistory;
+                                    failedAttempts = senderWallet.failedAttempts;
+                                    lastFailedAttempt = senderWallet.lastFailedAttempt;
+                                    isLocked = senderWallet.isLocked;
+                                };
+                                
+                                // Update recipient wallet
+                                let updatedRecipientWallet = {
+                                    address = recipientWallet.address;
+                                    icpBalance = recipientWallet.icpBalance;
+                                    stablecoinBalance = recipientWallet.stablecoinBalance + amount;
+                                    pinHash = recipientWallet.pinHash;
+                                    createdAt = recipientWallet.createdAt;
+                                    lastActivity = Time.now();
+                                    transactionHistory = recipientWallet.transactionHistory;
+                                    failedAttempts = recipientWallet.failedAttempts;
+                                    lastFailedAttempt = recipientWallet.lastFailedAttempt;
+                                    isLocked = recipientWallet.isLocked;
+                                };
+                                
+                                wallets.put(senderWallet.address, updatedSenderWallet);
+                                wallets.put(recipientAddress, updatedRecipientWallet);
+                                
+                                let transferTransaction = createTransaction(#stablecoinTransfer, amount, ?senderWallet.address, ?recipientAddress, "STABLECOIN", signature);
+                                addTransactionToWallet(senderWallet.address, transferTransaction);
+                                addTransactionToWallet(recipientAddress, transferTransaction);
+                                
+                                Debug.print("Secure stablecoin transfer successful: " # Nat.toText(amount) # " from " # Principal.toText(senderWallet.address) # " to " # Principal.toText(recipientAddress));
+                                #ok(())
+                            };
+                            case null {
+                                #err(#walletNotFound)
+                            };
+                        }
                     };
                 }
             };
-        };
+        }
     };
     
     // ======================
-    // ENHANCED QUERY FUNCTIONS
+    // QUERY FUNCTIONS (UPDATED WITH SECURITY)
     // ======================
     
-    /// Gets combined wallet balances (ICP + Stablecoin)
+    /// Gets combined wallet balances with secure authentication
     public query func getWalletInfo(phoneNumber: Text, pin: Text): async Result<{
         icpBalance: Nat;
         stablecoinBalance: Nat;
         totalTransactions: Nat;
         lastActivity: Time;
+        isLocked: Bool;
+        failedAttempts: Nat;
     }, WalletError> {
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
@@ -579,12 +786,24 @@ actor ICPNomadWallet {
         
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
-                #ok({
-                    icpBalance = wallet.icpBalance;
-                    stablecoinBalance = wallet.stablecoinBalance;
-                    totalTransactions = wallet.transactionHistory.size();
-                    lastActivity = wallet.lastActivity;
-                })
+                // Check if account is locked
+                if (isAccountLocked(wallet)) {
+                    return #err(#accountLocked);
+                };
+                
+                // Verify PIN
+                if (verifyPin(phoneNumber, pin, wallet.pinHash)) {
+                    #ok({
+                        icpBalance = wallet.icpBalance;
+                        stablecoinBalance = wallet.stablecoinBalance;
+                        totalTransactions = wallet.transactionHistory.size();
+                        lastActivity = wallet.lastActivity;
+                        isLocked = wallet.isLocked;
+                        failedAttempts = wallet.failedAttempts;
+                    })
+                } else {
+                    #err(#invalidCredentials)
+                }
             };
             case null {
                 #err(#walletNotFound)
@@ -592,41 +811,29 @@ actor ICPNomadWallet {
         };
     };
     
-    /// Gets transaction history with token type filtering
+    /// Gets transaction history with secure authentication
     public query func getTransactionHistory(phoneNumber: Text, pin: Text): async Result<[Transaction], WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return #err(#invalidCredentials);
-        };
-        
-        let walletAddress = deriveWalletAddress(phoneNumber, pin);
-        
-        switch (wallets.get(walletAddress)) {
-            case (?wallet) {
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#ok(wallet)) {
                 #ok(wallet.transactionHistory)
             };
-            case null {
-                #err(#walletNotFound)
+            case (#err(error)) {
+                #err(error)
             };
         };
     };
     
-    /// Gets stablecoin transactions only
+    /// Gets stablecoin transactions only with secure authentication
     public query func getStablecoinTransactionHistory(phoneNumber: Text, pin: Text): async Result<[Transaction], WalletError> {
-        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return #err(#invalidCredentials);
-        };
-        
-        let walletAddress = deriveWalletAddress(phoneNumber, pin);
-        
-        switch (wallets.get(walletAddress)) {
-            case (?wallet) {
+        switch (authenticateUser(phoneNumber, pin)) {
+            case (#ok(wallet)) {
                 let stablecoinTxs = Array.filter<Transaction>(wallet.transactionHistory, func(tx) {
                     tx.tokenType == "STABLECOIN"
                 });
                 #ok(stablecoinTxs)
             };
-            case null {
-                #err(#walletNotFound)
+            case (#err(error)) {
+                #err(error)
             };
         };
     };
@@ -635,22 +842,55 @@ actor ICPNomadWallet {
     // ADMIN FUNCTIONS (UPDATED)
     // ======================
     
-    /// Updates stablecoin canister ID (admin function)
-    public func setStablecoinCanisterId(canisterId: Text): async Result<(), WalletError> {
+    /// Updates security configuration (admin function)
+    public func updateSecurityConfig(
+        newMaxFailedAttempts: ?Nat,
+        newLockoutDuration: ?Int,
+        newSecuritySalt: ?Text
+    ): async Result<(), WalletError> {
         // TODO: Add proper admin authentication
-        stablecoinCanisterId := canisterId;
-        Debug.print("Stablecoin canister ID updated to: " # canisterId);
+        
+        switch (newMaxFailedAttempts) {
+            case (?attempts) { maxFailedAttempts := attempts };
+            case null {};
+        };
+        
+        switch (newLockoutDuration) {
+            case (?duration) { lockoutDuration := duration };
+            case null {};
+        };
+        
+        switch (newSecuritySalt) {
+            case (?salt) { securitySalt := salt };
+            case null {};
+        };
+        
+        Debug.print("Security configuration updated");
         #ok(())
     };
     
-    /// Gets canister statistics with stablecoin info
+    /// Unlocks a specific account (admin function)
+    public func unlockAccount(phoneNumber: Text): async Result<(), WalletError> {
+        // TODO: Add proper admin authentication
+        
+        // This function would need to iterate through wallets to find the one to unlock
+        // Since we don't store phone numbers, this is a placeholder for admin functionality
+        // In practice, this might require additional indexing or admin-specific functionality
+        
+        Debug.print("Account unlock requested for: " # phoneNumber);
+        #ok(())
+    };
+    
+    /// Gets canister statistics with security info
     public query func getCanisterStats(): async {
         totalWallets: Nat;
         totalTransactions: Nat;
         totalStablecoinTransactions: Nat;
         totalStablecoinBalance: Nat;
+        lockedAccounts: Nat;
         canisterCreatedAt: Time;
         stablecoinCanisterId: Text;
+        securityEnabled: Bool;
     } {
         let walletEntries = Iter.toArray(wallets.entries());
         
@@ -677,23 +917,33 @@ actor ICPNomadWallet {
             func(acc, (_, wallet)) = acc + wallet.stablecoinBalance
         );
         
+        let lockedAccounts = Array.foldLeft<(Principal, Wallet), Nat>(
+            walletEntries,
+            0,
+            func(acc, (_, wallet)) = if (wallet.isLocked) acc + 1 else acc
+        );
+        
         {
             totalWallets = wallets.size();
             totalTransactions = totalTransactions;
             totalStablecoinTransactions = totalStablecoinTransactions;
             totalStablecoinBalance = totalStablecoinBalance;
+            lockedAccounts = lockedAccounts;
             canisterCreatedAt = canisterCreatedAt;
             stablecoinCanisterId = stablecoinCanisterId;
+            securityEnabled = true;
         }
     };
     
-    /// Health check function with stablecoin status
+    /// Health check function with security status
     public query func healthCheck(): async {
         status: Text;
         timestamp: Time;
         walletCount: Nat;
         stablecoinSupported: Bool;
         stablecoinCanisterId: Text;
+        securityEnabled: Bool;
+        maxFailedAttempts: Nat;
     } {
         {
             status = "healthy";
@@ -701,10 +951,12 @@ actor ICPNomadWallet {
             walletCount = wallets.size();
             stablecoinSupported = true;
             stablecoinCanisterId = stablecoinCanisterId;
+            securityEnabled = true;
+            maxFailedAttempts = maxFailedAttempts;
         }
     };
     
-    /// Checks if a wallet exists for given credentials
+    /// Checks if a wallet exists for given credentials with security validation
     public query func walletExists(phoneNumber: Text, pin: Text): async Bool {
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return false;
@@ -713,7 +965,10 @@ actor ICPNomadWallet {
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
         switch (wallets.get(walletAddress)) {
-            case (?_) { true };
+            case (?wallet) { 
+                // Verify PIN to ensure this is a legitimate check
+                verifyPin(phoneNumber, pin, wallet.pinHash)
+            };
             case null { false };
         };
     };
