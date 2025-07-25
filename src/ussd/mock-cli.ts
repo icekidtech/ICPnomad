@@ -1,7 +1,7 @@
 import readline from 'readline';
 import chalk from 'chalk';
 import figlet from 'figlet';
-import { ussdService } from './ussdService';
+import { ussdService } from './USSDService';
 
 // Mock USSD session interface
 interface MockUSSDSession {
