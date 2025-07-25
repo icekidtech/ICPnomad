@@ -6,6 +6,10 @@
       "main": "src/canisters/ICPNomadWallet.mo",
       "dependencies": ["sha256"]
     },
+    "custom_stablecoin": {
+      "type": "motoko",
+      "main": "src/canisters/CustomStablecoin.mo"
+    },
     "icpnomad_backend": {
       "type": "custom",
       "build": "pnpm run build:backend",
