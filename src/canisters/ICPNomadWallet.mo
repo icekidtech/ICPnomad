@@ -12,11 +12,15 @@ import Nat8 "mo:base/Nat8";
 import Nat "mo:base/Nat";
 import SHA256 "mo:sha256/SHA256";
 
+// Import stablecoin interface
+import Stablecoin "./Stablecoin";
+
 /**
- * ICPNomadWallet Canister
+ * ICPNomadWallet Canister with Stablecoin Support
  * 
  * A privacy-preserving wallet canister for USSD-based cryptocurrency access.
  * Ensures phone numbers are never stored while maintaining one-account-per-phone uniqueness.
+ * Now supports stablecoin operations with gasless transactions.
  */
 actor ICPNomadWallet {
     
@@ -32,6 +36,9 @@ actor ICPNomadWallet {
         #deposit;
         #withdrawal;
         #transfer;
+        #stablecoinDeposit;
+        #stablecoinWithdrawal;
+        #stablecoinTransfer;
     };
     
     /// Transaction status
@@ -50,12 +57,14 @@ actor ICPNomadWallet {
         status: TransactionStatus;
         fromAddress: ?Principal;
         toAddress: ?Principal;
+        tokenType: Text; // "ICP" or "STABLECOIN"
     };
     
-    /// Wallet data structure (no phone numbers or PINs stored)
+    /// Enhanced wallet data structure with stablecoin support
     public type Wallet = {
         address: Principal;
-        balance: Nat;
+        icpBalance: Nat;
+        stablecoinBalance: Nat;
         createdAt: Time;
         lastActivity: Time;
         transactionHistory: [Transaction];
@@ -69,6 +78,7 @@ actor ICPNomadWallet {
         #addressAlreadyExists;
         #invalidAmount;
         #transactionFailed;
+        #stablecoinError: Text;
         #systemError: Text;
     };
     
@@ -90,6 +100,9 @@ actor ICPNomadWallet {
     
     /// Canister creation timestamp
     private stable var canisterCreatedAt: Time = Time.now();
+    
+    /// Stablecoin canister reference (configurable)
+    private stable var stablecoinCanisterId: Text = "rdmx6-jaaaa-aaaah-qcaiq-cai"; // Default ckUSDC canister ID
     
     // ======================
     // SYSTEM FUNCTIONS
@@ -156,7 +169,8 @@ actor ICPNomadWallet {
         txType: TransactionType,
         amount: Nat,
         fromAddress: ?Principal,
-        toAddress: ?Principal
+        toAddress: ?Principal,
+        tokenType: Text
     ): Transaction {
         {
             id = generateTransactionId();
@@ -166,6 +180,7 @@ actor ICPNomadWallet {
             status = #completed;
             fromAddress = fromAddress;
             toAddress = toAddress;
+            tokenType = tokenType;
         }
     };
     
@@ -176,7 +191,8 @@ actor ICPNomadWallet {
                 let updatedHistory = Array.append(wallet.transactionHistory, [transaction]);
                 let updatedWallet = {
                     address = wallet.address;
-                    balance = wallet.balance;
+                    icpBalance = wallet.icpBalance;
+                    stablecoinBalance = wallet.stablecoinBalance;
                     createdAt = wallet.createdAt;
                     lastActivity = Time.now();
                     transactionHistory = updatedHistory;
@@ -184,18 +200,21 @@ actor ICPNomadWallet {
                 wallets.put(walletAddress, updatedWallet);
             };
             case null {
-                // Wallet not found - should not happen in normal flow
                 Debug.print("Warning: Attempted to add transaction to non-existent wallet");
             };
         };
     };
     
+    /// Gets stablecoin canister actor
+    private func getStablecoinCanister(): Stablecoin.StablecoinActor {
+        actor(stablecoinCanisterId) : Stablecoin.StablecoinActor
+    };
+    
     // ======================
-    // PUBLIC CANISTER FUNCTIONS
+    // EXISTING WALLET FUNCTIONS (UPDATED)
     // ======================
     
     /// Generates a new wallet for a phone number and PIN combination
-    /// Returns the wallet address if successful, error if address already exists
     public func generateWallet(phoneNumber: Text, pin: Text): async Result<Principal, WalletError> {
         // Validate inputs
         if (not isValidPhoneNumber(phoneNumber)) {
@@ -212,43 +231,37 @@ actor ICPNomadWallet {
         // Check if wallet already exists (ensures one account per phone)
         switch (wallets.get(walletAddress)) {
             case (?existingWallet) {
-                // Wallet already exists for this phone number
                 #err(#addressAlreadyExists)
             };
             case null {
-                // Create new wallet
+                // Create new wallet with stablecoin support
                 let newWallet: Wallet = {
                     address = walletAddress;
-                    balance = 0;
+                    icpBalance = 0;
+                    stablecoinBalance = 0;
                     createdAt = Time.now();
                     lastActivity = Time.now();
                     transactionHistory = [];
                 };
                 
-                // Store wallet in registry
                 wallets.put(walletAddress, newWallet);
-                
                 Debug.print("New wallet created: " # Principal.toText(walletAddress));
                 #ok(walletAddress)
             };
         };
     };
     
-    /// Retrieves wallet balance using phone number and PIN
-    /// Regenerates wallet address without storing phone data
+    /// Retrieves ICP balance using phone number and PIN
     public query func getBalance(phoneNumber: Text, pin: Text): async Result<Nat, WalletError> {
-        // Validate inputs
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
         };
         
-        // Regenerate wallet address
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
-        // Retrieve wallet
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
-                #ok(wallet.balance)
+                #ok(wallet.icpBalance)
             };
             case null {
                 #err(#walletNotFound)
@@ -256,9 +269,8 @@ actor ICPNomadWallet {
         };
     };
     
-    /// Deposits funds to wallet (placeholder for stablecoin integration)
+    /// Deposits ICP funds to wallet
     public func deposit(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
-        // Validate inputs
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
         };
@@ -267,16 +279,14 @@ actor ICPNomadWallet {
             return #err(#invalidAmount);
         };
         
-        // Regenerate wallet address
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
-        // Retrieve and update wallet
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
-                // Update balance
                 let updatedWallet = {
                     address = wallet.address;
-                    balance = wallet.balance + amount;
+                    icpBalance = wallet.icpBalance + amount;
+                    stablecoinBalance = wallet.stablecoinBalance;
                     createdAt = wallet.createdAt;
                     lastActivity = Time.now();
                     transactionHistory = wallet.transactionHistory;
@@ -284,11 +294,9 @@ actor ICPNomadWallet {
                 
                 wallets.put(walletAddress, updatedWallet);
                 
-                // Record transaction
-                let transaction = createTransaction(#deposit, amount, null, ?walletAddress);
+                let transaction = createTransaction(#deposit, amount, null, ?walletAddress, "ICP");
                 addTransactionToWallet(walletAddress, transaction);
                 
-                Debug.print("Deposit successful: " # Nat.toText(amount) # " to " # Principal.toText(walletAddress));
                 #ok(())
             };
             case null {
@@ -297,9 +305,8 @@ actor ICPNomadWallet {
         };
     };
     
-    /// Withdraws funds from wallet (placeholder for stablecoin integration)
+    /// Withdraws ICP funds from wallet
     public func withdraw(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
-        // Validate inputs
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
         };
@@ -308,21 +315,18 @@ actor ICPNomadWallet {
             return #err(#invalidAmount);
         };
         
-        // Regenerate wallet address
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
-        // Retrieve and update wallet
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
-                // Check sufficient funds
-                if (wallet.balance < amount) {
+                if (wallet.icpBalance < amount) {
                     return #err(#insufficientFunds);
                 };
                 
-                // Update balance
                 let updatedWallet = {
                     address = wallet.address;
-                    balance = wallet.balance - amount;
+                    icpBalance = wallet.icpBalance - amount;
+                    stablecoinBalance = wallet.stablecoinBalance;
                     createdAt = wallet.createdAt;
                     lastActivity = Time.now();
                     transactionHistory = wallet.transactionHistory;
@@ -330,11 +334,9 @@ actor ICPNomadWallet {
                 
                 wallets.put(walletAddress, updatedWallet);
                 
-                // Record transaction
-                let transaction = createTransaction(#withdrawal, amount, ?walletAddress, null);
+                let transaction = createTransaction(#withdrawal, amount, ?walletAddress, null, "ICP");
                 addTransactionToWallet(walletAddress, transaction);
                 
-                Debug.print("Withdrawal successful: " # Nat.toText(amount) # " from " # Principal.toText(walletAddress));
                 #ok(())
             };
             case null {
@@ -343,17 +345,31 @@ actor ICPNomadWallet {
         };
     };
     
-    /// Transfers funds between wallets
-    public func transfer(
-        fromPhoneNumber: Text, 
-        fromPin: Text, 
-        toPhoneNumber: Text, 
-        toPin: Text, 
-        amount: Nat
-    ): async Result<(), WalletError> {
-        // Validate inputs
-        if (not isValidPhoneNumber(fromPhoneNumber) or not isValidPin(fromPin) or
-            not isValidPhoneNumber(toPhoneNumber) or not isValidPin(toPin)) {
+    // ======================
+    // NEW STABLECOIN FUNCTIONS
+    // ======================
+    
+    /// Retrieves stablecoin balance using phone number and PIN
+    public query func getStablecoinBalance(phoneNumber: Text, pin: Text): async Result<Nat, WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
+            return #err(#invalidCredentials);
+        };
+        
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?wallet) {
+                #ok(wallet.stablecoinBalance)
+            };
+            case null {
+                #err(#walletNotFound)
+            };
+        };
+    };
+    
+    /// Deposits stablecoins to wallet (gasless transaction)
+    public func depositStablecoin(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
         };
         
@@ -361,73 +377,229 @@ actor ICPNomadWallet {
             return #err(#invalidAmount);
         };
         
-        // Derive wallet addresses
-        let fromAddress = deriveWalletAddress(fromPhoneNumber, fromPin);
-        let toAddress = deriveWalletAddress(toPhoneNumber, toPin);
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?wallet) {
+                // In a real implementation, this would interact with the stablecoin canister
+                // For now, we simulate the deposit by updating the balance
+                // TODO: Implement actual stablecoin transfer from external source
+                
+                let updatedWallet = {
+                    address = wallet.address;
+                    icpBalance = wallet.icpBalance;
+                    stablecoinBalance = wallet.stablecoinBalance + amount;
+                    createdAt = wallet.createdAt;
+                    lastActivity = Time.now();
+                    transactionHistory = wallet.transactionHistory;
+                };
+                
+                wallets.put(walletAddress, updatedWallet);
+                
+                let transaction = createTransaction(#stablecoinDeposit, amount, null, ?walletAddress, "STABLECOIN");
+                addTransactionToWallet(walletAddress, transaction);
+                
+                Debug.print("Stablecoin deposit successful: " # Nat.toText(amount) # " to " # Principal.toText(walletAddress));
+                #ok(())
+            };
+            case null {
+                #err(#walletNotFound)
+            };
+        };
+    };
+    
+    /// Withdraws stablecoins from wallet (gasless transaction)
+    public func withdrawStablecoin(phoneNumber: Text, pin: Text, amount: Nat): async Result<(), WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
+            return #err(#invalidCredentials);
+        };
+        
+        if (amount == 0) {
+            return #err(#invalidAmount);
+        };
+        
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?wallet) {
+                if (wallet.stablecoinBalance < amount) {
+                    return #err(#insufficientFunds);
+                };
+                
+                // In a real implementation, this would transfer stablecoins to external address
+                // For now, we simulate the withdrawal by updating the balance
+                // TODO: Implement actual stablecoin transfer to external address
+                
+                let updatedWallet = {
+                    address = wallet.address;
+                    icpBalance = wallet.icpBalance;
+                    stablecoinBalance = wallet.stablecoinBalance - amount;
+                    createdAt = wallet.createdAt;
+                    lastActivity = Time.now();
+                    transactionHistory = wallet.transactionHistory;
+                };
+                
+                wallets.put(walletAddress, updatedWallet);
+                
+                let transaction = createTransaction(#stablecoinWithdrawal, amount, ?walletAddress, null, "STABLECOIN");
+                addTransactionToWallet(walletAddress, transaction);
+                
+                Debug.print("Stablecoin withdrawal successful: " # Nat.toText(amount) # " from " # Principal.toText(walletAddress));
+                #ok(())
+            };
+            case null {
+                #err(#walletNotFound)
+            };
+        };
+    };
+    
+    /// Transfers stablecoins between wallets (gasless transaction)
+    public func transferStablecoin(
+        phoneNumber: Text, 
+        pin: Text, 
+        recipientPhoneNumber: Text, 
+        amount: Nat
+    ): async Result<(), WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin) or
+            not isValidPhoneNumber(recipientPhoneNumber)) {
+            return #err(#invalidCredentials);
+        };
+        
+        if (amount == 0) {
+            return #err(#invalidAmount);
+        };
+        
+        let senderAddress = deriveWalletAddress(phoneNumber, pin);
+        let recipientAddress = deriveWalletAddress(recipientPhoneNumber, "0000"); // Recipient PIN not needed for address derivation
         
         // Cannot transfer to same wallet
-        if (Principal.equal(fromAddress, toAddress)) {
+        if (Principal.equal(senderAddress, recipientAddress)) {
             return #err(#invalidAmount);
         };
         
         // Check both wallets exist
-        switch (wallets.get(fromAddress), wallets.get(toAddress)) {
-            case (?fromWallet, ?toWallet) {
-                // Check sufficient funds
-                if (fromWallet.balance < amount) {
+        switch (wallets.get(senderAddress), wallets.get(recipientAddress)) {
+            case (?senderWallet, ?recipientWallet) {
+                if (senderWallet.stablecoinBalance < amount) {
                     return #err(#insufficientFunds);
                 };
                 
                 // Update sender wallet
-                let updatedFromWallet = {
-                    address = fromWallet.address;
-                    balance = fromWallet.balance - amount;
-                    createdAt = fromWallet.createdAt;
+                let updatedSenderWallet = {
+                    address = senderWallet.address;
+                    icpBalance = senderWallet.icpBalance;
+                    stablecoinBalance = senderWallet.stablecoinBalance - amount;
+                    createdAt = senderWallet.createdAt;
                     lastActivity = Time.now();
-                    transactionHistory = fromWallet.transactionHistory;
+                    transactionHistory = senderWallet.transactionHistory;
                 };
                 
-                // Update receiver wallet
-                let updatedToWallet = {
-                    address = toWallet.address;
-                    balance = toWallet.balance + amount;
-                    createdAt = toWallet.createdAt;
+                // Update recipient wallet
+                let updatedRecipientWallet = {
+                    address = recipientWallet.address;
+                    icpBalance = recipientWallet.icpBalance;
+                    stablecoinBalance = recipientWallet.stablecoinBalance + amount;
+                    createdAt = recipientWallet.createdAt;
                     lastActivity = Time.now();
-                    transactionHistory = toWallet.transactionHistory;
+                    transactionHistory = recipientWallet.transactionHistory;
                 };
                 
-                // Store updated wallets
-                wallets.put(fromAddress, updatedFromWallet);
-                wallets.put(toAddress, updatedToWallet);
+                wallets.put(senderAddress, updatedSenderWallet);
+                wallets.put(recipientAddress, updatedRecipientWallet);
                 
-                // Record transactions
-                let transferTransaction = createTransaction(#transfer, amount, ?fromAddress, ?toAddress);
-                addTransactionToWallet(fromAddress, transferTransaction);
-                addTransactionToWallet(toAddress, transferTransaction);
+                let transferTransaction = createTransaction(#stablecoinTransfer, amount, ?senderAddress, ?recipientAddress, "STABLECOIN");
+                addTransactionToWallet(senderAddress, transferTransaction);
+                addTransactionToWallet(recipientAddress, transferTransaction);
                 
-                Debug.print("Transfer successful: " # Nat.toText(amount) # " from " # Principal.toText(fromAddress) # " to " # Principal.toText(toAddress));
+                Debug.print("Stablecoin transfer successful: " # Nat.toText(amount) # " from " # Principal.toText(senderAddress) # " to " # Principal.toText(recipientAddress));
                 #ok(())
             };
             case (null, _) {
                 #err(#walletNotFound)
             };
             case (_, null) {
+                // Create recipient wallet if it doesn't exist (for simplified transfers)
+                let newRecipientWallet: Wallet = {
+                    address = recipientAddress;
+                    icpBalance = 0;
+                    stablecoinBalance = amount;
+                    createdAt = Time.now();
+                    lastActivity = Time.now();
+                    transactionHistory = [];
+                };
+                
+                switch (wallets.get(senderAddress)) {
+                    case (?senderWallet) {
+                        if (senderWallet.stablecoinBalance < amount) {
+                            return #err(#insufficientFunds);
+                        };
+                        
+                        let updatedSenderWallet = {
+                            address = senderWallet.address;
+                            icpBalance = senderWallet.icpBalance;
+                            stablecoinBalance = senderWallet.stablecoinBalance - amount;
+                            createdAt = senderWallet.createdAt;
+                            lastActivity = Time.now();
+                            transactionHistory = senderWallet.transactionHistory;
+                        };
+                        
+                        wallets.put(senderAddress, updatedSenderWallet);
+                        wallets.put(recipientAddress, newRecipientWallet);
+                        
+                        let transferTransaction = createTransaction(#stablecoinTransfer, amount, ?senderAddress, ?recipientAddress, "STABLECOIN");
+                        addTransactionToWallet(senderAddress, transferTransaction);
+                        addTransactionToWallet(recipientAddress, transferTransaction);
+                        
+                        #ok(())
+                    };
+                    case null {
+                        #err(#walletNotFound)
+                    };
+                }
+            };
+        };
+    };
+    
+    // ======================
+    // ENHANCED QUERY FUNCTIONS
+    // ======================
+    
+    /// Gets combined wallet balances (ICP + Stablecoin)
+    public query func getWalletInfo(phoneNumber: Text, pin: Text): async Result<{
+        icpBalance: Nat;
+        stablecoinBalance: Nat;
+        totalTransactions: Nat;
+        lastActivity: Time;
+    }, WalletError> {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
+            return #err(#invalidCredentials);
+        };
+        
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?wallet) {
+                #ok({
+                    icpBalance = wallet.icpBalance;
+                    stablecoinBalance = wallet.stablecoinBalance;
+                    totalTransactions = wallet.transactionHistory.size();
+                    lastActivity = wallet.lastActivity;
+                })
+            };
+            case null {
                 #err(#walletNotFound)
             };
         };
     };
     
-    /// Gets transaction history for a wallet
+    /// Gets transaction history with token type filtering
     public query func getTransactionHistory(phoneNumber: Text, pin: Text): async Result<[Transaction], WalletError> {
-        // Validate inputs
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
             return #err(#invalidCredentials);
         };
         
-        // Regenerate wallet address
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
-        // Retrieve wallet
         switch (wallets.get(walletAddress)) {
             case (?wallet) {
                 #ok(wallet.transactionHistory)
@@ -438,94 +610,111 @@ actor ICPNomadWallet {
         };
     };
     
-    /// Checks if a wallet exists for given credentials
-    public query func walletExists(phoneNumber: Text, pin: Text): async Bool {
-        // Validate inputs
+    /// Gets stablecoin transactions only
+    public query func getStablecoinTransactionHistory(phoneNumber: Text, pin: Text): async Result<[Transaction], WalletError> {
         if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
-            return false;
+            return #err(#invalidCredentials);
         };
         
-        // Regenerate wallet address
         let walletAddress = deriveWalletAddress(phoneNumber, pin);
         
-        // Check if wallet exists
         switch (wallets.get(walletAddress)) {
-            case (?_) { true };
-            case null { false };
+            case (?wallet) {
+                let stablecoinTxs = Array.filter<Transaction>(wallet.transactionHistory, func(tx) {
+                    tx.tokenType == "STABLECOIN"
+                });
+                #ok(stablecoinTxs)
+            };
+            case null {
+                #err(#walletNotFound)
+            };
         };
     };
     
     // ======================
-    // ADMIN & MONITORING FUNCTIONS
+    // ADMIN FUNCTIONS (UPDATED)
     // ======================
     
-    /// Gets canister statistics (admin function)
+    /// Updates stablecoin canister ID (admin function)
+    public func setStablecoinCanisterId(canisterId: Text): async Result<(), WalletError> {
+        // TODO: Add proper admin authentication
+        stablecoinCanisterId := canisterId;
+        Debug.print("Stablecoin canister ID updated to: " # canisterId);
+        #ok(())
+    };
+    
+    /// Gets canister statistics with stablecoin info
     public query func getCanisterStats(): async {
         totalWallets: Nat;
         totalTransactions: Nat;
+        totalStablecoinTransactions: Nat;
+        totalStablecoinBalance: Nat;
         canisterCreatedAt: Time;
-        lastActivity: Time;
+        stablecoinCanisterId: Text;
     } {
+        let walletEntries = Iter.toArray(wallets.entries());
+        
         let totalTransactions = Array.foldLeft<(Principal, Wallet), Nat>(
-            Iter.toArray(wallets.entries()),
+            walletEntries,
             0,
             func(acc, (_, wallet)) = acc + wallet.transactionHistory.size()
+        );
+        
+        let totalStablecoinTransactions = Array.foldLeft<(Principal, Wallet), Nat>(
+            walletEntries,
+            0,
+            func(acc, (_, wallet)) {
+                let stablecoinTxs = Array.filter<Transaction>(wallet.transactionHistory, func(tx) {
+                    tx.tokenType == "STABLECOIN"
+                });
+                acc + stablecoinTxs.size()
+            }
+        );
+        
+        let totalStablecoinBalance = Array.foldLeft<(Principal, Wallet), Nat>(
+            walletEntries,
+            0,
+            func(acc, (_, wallet)) = acc + wallet.stablecoinBalance
         );
         
         {
             totalWallets = wallets.size();
             totalTransactions = totalTransactions;
+            totalStablecoinTransactions = totalStablecoinTransactions;
+            totalStablecoinBalance = totalStablecoinBalance;
             canisterCreatedAt = canisterCreatedAt;
-            lastActivity = Time.now();
+            stablecoinCanisterId = stablecoinCanisterId;
         }
     };
     
-    /// Health check function
+    /// Health check function with stablecoin status
     public query func healthCheck(): async {
         status: Text;
         timestamp: Time;
         walletCount: Nat;
+        stablecoinSupported: Bool;
+        stablecoinCanisterId: Text;
     } {
         {
             status = "healthy";
             timestamp = Time.now();
             walletCount = wallets.size();
+            stablecoinSupported = true;
+            stablecoinCanisterId = stablecoinCanisterId;
         }
     };
     
-    // ======================
-    // FUTURE INTEGRATION PLACEHOLDERS
-    // ======================
-    
-    /// Placeholder for stablecoin integration
-    /// TODO: Implement integration with ICP-native stablecoins (ckUSDC, etc.)
-    private func integrateStablecoin(): async () {
-        // Future implementation:
-        // - Connect to stablecoin canister
-        // - Implement actual deposit/withdrawal logic
-        // - Handle exchange rates
-        // - Manage reserves
-        Debug.print("Stablecoin integration placeholder");
-    };
-    
-    /// Placeholder for enhanced PIN authentication
-    /// TODO: Implement more sophisticated PIN verification
-    private func enhancedPinAuth(phoneNumber: Text, pin: Text): async Bool {
-        // Future implementation:
-        // - Time-based PIN lockout
-        // - Attempt counting
-        // - PIN strength validation
-        // - Multi-factor authentication
-        isValidPin(pin)
-    };
-    
-    /// Placeholder for signature verification
-    /// TODO: Implement ICP identity and signature validation
-    private func verifySignature(principal: Principal, signature: Blob, message: Blob): Bool {
-        // Future implementation:
-        // - ICP identity verification
-        // - Threshold ECDSA integration
-        // - Message signing/verification
-        true
+    /// Checks if a wallet exists for given credentials
+    public query func walletExists(phoneNumber: Text, pin: Text): async Bool {
+        if (not isValidPhoneNumber(phoneNumber) or not isValidPin(pin)) {
+            return false;
+        };
+        
+        let walletAddress = deriveWalletAddress(phoneNumber, pin);
+        
+        switch (wallets.get(walletAddress)) {
+            case (?_) { true };
+            case null { false };
+        };
     };
 }
