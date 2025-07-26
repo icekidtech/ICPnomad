@@ -13,7 +13,8 @@ import mongoose, { Schema, Document } from 'mongoose';
  * NEVER store sensitive data or use this as the primary transaction record.
  */
 
-export interface ITransactionLog extends Document {
+// Base interface without methods
+interface ITransactionLogBase {
   // Canister transaction reference
   canisterTransactionId: number; // Maps to canister transaction ID
   walletAddress: string; // Principal address involved in transaction
@@ -74,6 +75,16 @@ export interface ITransactionLog extends Document {
   updatedAt: Date;
   version: number;
 }
+
+// Methods interface
+interface ITransactionLogMethods {
+  calculateAnalytics(): void;
+  markCompleted(): Promise<ITransactionLog>;
+  markFailed(errorCode: string, errorMessage: string): Promise<ITransactionLog>;
+}
+
+// Combined interface
+export interface ITransactionLog extends Document, ITransactionLogBase, ITransactionLogMethods {}
 
 const TransactionLogSchema = new Schema<ITransactionLog>({
   canisterTransactionId: {
