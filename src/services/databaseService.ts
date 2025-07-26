@@ -4,9 +4,9 @@ import mongoose from 'mongoose';
 import { logger } from '@/config/logger';
 
 // Import MongoDB models (optional)
-import { UserMetadata, UserMetadataDocument } from '@/models/user';
-import { WalletSnapshot, WalletSnapshotDocument } from '@/models/wallet';
-import { TransactionLog, TransactionLogDocument } from '@/models/transaction';
+import { UserMetadata, UserMetadataDocument } from '../models/User';
+import { WalletSnapshot, WalletSnapshotDocument } from '../models/Wallet';
+import { TransactionLog, TransactionLogDocument } from '../models/Transaction';
 
 // Import canister interface
 import { canisterService } from './canisterService';
